@@ -29,7 +29,11 @@ class NVEmbedV2EmbeddingModel(BaseEmbeddingModel):
         # Initializing the embedding model
         logger.debug(f"Initializing {self.__class__.__name__}'s embedding model with params: {self.embedding_config.model_init_params}")
 
-        self.embedding_model = AutoModel.from_pretrained(**self.embedding_config.model_init_params)
+        model_params = dict(self.embedding_config.model_init_params)
+        if model_params.get("torch_dtype") == "bfloat16":
+            model_params["torch_dtype"] = torch.bfloat16
+
+        self.embedding_model = AutoModel.from_pretrained(**model_params)
         self.embedding_dim = self.embedding_model.config.hidden_size
 
     def unload_model(self):
@@ -81,7 +85,7 @@ class NVEmbedV2EmbeddingModel(BaseEmbeddingModel):
                 "pretrained_model_name_or_path": self.embedding_model_name,
                 "trust_remote_code": True,
                 'device_map': "auto",  # added this line to use multiple GPUs
-                "torch_dtype": self.global_config.embedding_model_dtype,
+                "torch_dtype": "bfloat16",
                 # **kwargs
             },
             "encode_params": {
