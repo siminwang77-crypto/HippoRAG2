@@ -23,20 +23,15 @@ logs/
 # Temporary files
 *.bak
 *.before*
-
-# Debug backup files
-*.bak*
-*.before*
 *.batch_bak
 *.debug_bak
 
-# Dataset
+# Large datasets
 data/
 datasets/
 
 # Results
 results/
-outputs/
 
 # Vector database
 *.faiss
@@ -51,6 +46,3 @@ outputs/
 
 # Jupyter
 .ipynb_checkpoints/
-
-# Dataset
-reproduce/dataset/
