@@ -1,0 +1,489 @@
+diff --git a/main.py b/main.py
+index 4fd53f4..44bb60b 100644
+--- a/main.py
++++ b/main.py
+@@ -76,6 +76,9 @@ def parse_args():
+     parser.add_argument("--force_openie_from_scratch", default="false", help="Regenerate OpenIE only in a fresh/empty index directory")
+     parser.add_argument("--openie_mode", choices=["online", "offline", "Transformers-offline"], default="online", help="OpenIE execution mode")
+     parser.add_argument("--save_dir", default="outputs", help="Output directory prefix; custom values retain the legacy _<dataset> suffix")
++    parser.add_argument("--num_samples", type=int, default=None, help="Run only the first N QA samples; default uses all samples")
++    parser.add_argument("--corpus_file", type=str, default=None, help="Optional corpus filename under reproduce/dataset/")
++    parser.add_argument("--openie_triple_max_tokens", type=int, default=4096, help="Maximum output tokens for each OpenIE triple request")
+     return parser.parse_args()
+ 
+ 
+@@ -85,11 +88,15 @@ def main():
+         raise ValueError("dataset must be a name, not a path")
+     save_dir = str(PROJECT_ROOT / "outputs" / args.dataset) if args.save_dir == "outputs" else f"{args.save_dir}_{args.dataset}"
+     dataset_dir = PROJECT_ROOT / "reproduce" / "dataset"
+-    with open(dataset_dir / f"{args.dataset}_corpus.json", encoding="utf-8") as file:
++    corpus_filename = args.corpus_file or f"{args.dataset}_corpus.json"
++    with open(dataset_dir / corpus_filename, encoding="utf-8") as file:
+         corpus = json.load(file)
+     with open(dataset_dir / f"{args.dataset}.json", encoding="utf-8") as file:
+         samples = json.load(file)
+ 
++    if args.num_samples is not None:
++        samples = samples[:args.num_samples]
++
+     docs = [f"{doc['title']}\n{doc['text']}" for doc in corpus]
+     queries = [sample["question"] for sample in samples]
+     gold_answers = get_gold_answers(samples)
+@@ -120,6 +127,7 @@ def main():
+         qa_top_k=5,
+         embedding_batch_size=args.embedding_batch_size,
+         openie_mode=args.openie_mode,
++        openie_triple_max_tokens=args.openie_triple_max_tokens,
+     )
+     logging.basicConfig(level=logging.INFO)
+     rag_class = HippoRAG if args.rag_type == "hipporag" else StandardRAG
+diff --git a/src/hipporag/HippoRAG.py b/src/hipporag/HippoRAG.py
+index 8a87f5f..8728de2 100644
+--- a/src/hipporag/HippoRAG.py
++++ b/src/hipporag/HippoRAG.py
+@@ -336,7 +336,7 @@ class HippoRAG:
+ 
+     def _openie_state_identity(self) -> Dict[str, Any]:
+         return {
+-            "model_name": self.global_config.llm_name,
++            "model_name": self.global_config.llm_name.removeprefix("Transformers/"),
+             "azure_endpoint": self.global_config.azure_endpoint,
+             "azure_api_version": self.global_config.azure_api_version,
+             "azure_deployment": (self.global_config.azure_chat_deployment or self.global_config.llm_name) if self.global_config.azure_endpoint else None,
+@@ -558,7 +558,34 @@ class HippoRAG:
+         self.entity_embedding_store.insert_strings(entity_nodes)
+ 
+         logger.info(f"Encoding Facts")
+-        self.fact_embedding_store.insert_strings([str(fact) for fact in facts])
++
++        llm_for_memory_release = self.extraction_llm
++        embedding_for_memory_release = self.embedding_model
++
++        # 事实向量编码前释放 Llama 显存
++        if hasattr(llm_for_memory_release, "unload_model"):
++            logger.info("Temporarily unloading LLM before fact encoding.")
++            llm_for_memory_release.unload_model()
++
++        try:
++            self.fact_embedding_store.insert_strings(
++                [str(fact) for fact in facts]
++            )
++        finally:
++            # 重新加载 Llama 前释放 NV-Embed 显存
++            if hasattr(embedding_for_memory_release, "unload_model"):
++                logger.info("Unloading NV-Embed before reloading LLM.")
++                embedding_for_memory_release.unload_model()
++
++            # 重新加载 Llama
++            if hasattr(llm_for_memory_release, "reload_model"):
++                logger.info("Reloading LLM after fact encoding.")
++                llm_for_memory_release.reload_model()
++
++            # 将 NV-Embed 加载到 CPU，供后续检索使用
++            if hasattr(embedding_for_memory_release, "reload_model"):
++                logger.info("Reloading NV-Embed on CPU for retrieval.")
++                embedding_for_memory_release.reload_model(device_map="cpu")
+ 
+         logger.info(f"Constructing Graph")
+ 
+@@ -1439,8 +1466,36 @@ class HippoRAG:
+             triples = triple_results_dict[chunk_key].triples
+             if not isinstance(entities, list) or not all(isinstance(entity, str) for entity in entities):
+                 raise StateConsistencyError(f"Invalid NER result for chunk {chunk_key}.")
+-            if not isinstance(triples, list) or not all(isinstance(triple, (list, tuple)) and len(triple) == 3 and all(isinstance(value, str) for value in triple) for triple in triples):
++            if not isinstance(triples, list):
+                 raise StateConsistencyError(f"Invalid triple result for chunk {chunk_key}.")
++
++            repaired_triples = []
++            for triple in triples:
++                if not isinstance(triple, (list, tuple)):
++                    raise StateConsistencyError(f"Invalid triple result for chunk {chunk_key}.")
++
++                triple = [str(value).strip() for value in triple]
++
++                # 正常三元组：原样保留
++                if len(triple) == 3:
++                    repaired_triples.append(triple)
++
++                # 4 元组及以上：将第 3 项之后的内容合并到 object
++                elif len(triple) > 3:
++                    repaired_triples.append([
++                        triple[0],
++                        triple[1],
++                        " ".join(value for value in triple[2:] if value)
++                    ])
++
++                # 2 元组：暂时保留错误，让后续专门处理
++                else:
++                    raise StateConsistencyError(
++                        f"Invalid triple result for chunk {chunk_key}: "
++                        f"cannot repair triple with {len(triple)} elements: {triple}"
++                    )
++
++            triples = repaired_triples
+             merged_rows.append({'idx': chunk_key, 'passage': passage, 'extracted_entities': entities, 'extracted_triples': triples})
+ 
+         all_openie_info.extend(merged_rows)
+diff --git a/src/hipporag/embedding_model/NVEmbedV2.py b/src/hipporag/embedding_model/NVEmbedV2.py
+index c30231c..0e0af11 100644
+--- a/src/hipporag/embedding_model/NVEmbedV2.py
++++ b/src/hipporag/embedding_model/NVEmbedV2.py
+@@ -32,6 +32,38 @@ class NVEmbedV2EmbeddingModel(BaseEmbeddingModel):
+         self.embedding_model = AutoModel.from_pretrained(**self.embedding_config.model_init_params)
+         self.embedding_dim = self.embedding_model.config.hidden_size
+ 
++    def unload_model(self):
++        """Release NV-Embed-v2 GPU memory."""
++        import gc
++        import torch
++
++        if getattr(self, "embedding_model", None) is not None:
++            del self.embedding_model
++            self.embedding_model = None
++
++        gc.collect()
++
++        if torch.cuda.is_available():
++            torch.cuda.empty_cache()
++            torch.cuda.ipc_collect()
++
++        logger.info("NV-Embed-v2 model unloaded.")
++
++    def reload_model(self, device_map=None):
++        """Reload NV-Embed-v2 from the original configuration."""
++        from transformers import AutoModel
++
++        model_params = dict(self.embedding_config.model_init_params)
++
++        if device_map is not None:
++            model_params["device_map"] = device_map
++
++        self.embedding_model = AutoModel.from_pretrained(**model_params)
++        self.embedding_dim = self.embedding_model.config.hidden_size
++
++        logger.info("NV-Embed-v2 model reloaded on device_map=%s.", device_map)
++
++
+     def _init_embedding_config(self) -> None:
+         """
+         Extract embedding model-specific parameters to init the EmbeddingConfig.
+diff --git a/src/hipporag/information_extraction/openie_vllm_offline.py b/src/hipporag/information_extraction/openie_vllm_offline.py
+index c913fba..c0ddfdd 100644
+--- a/src/hipporag/information_extraction/openie_vllm_offline.py
++++ b/src/hipporag/information_extraction/openie_vllm_offline.py
+@@ -89,9 +89,136 @@ class VLLMOfflineOpenIE(OpenIE):
+             response = triple_output_instance
+             try:
+                 triples = json.loads(response)["triples"]
++
++                repaired_triples = []
++
++                for triple in triples:
++                    if not isinstance(triple, (list, tuple)):
++                        logger.warning(
++                            f"Invalid triple type for chunk_id {chunk_id}: {triple}"
++                        )
++                        continue
++
++                    triple = [str(value).strip() for value in triple]
++
++                    # 正常三元组：直接保留
++                    if len(triple) == 3:
++                        repaired_triples.append(triple)
++
++                    # 4 元组及以上：
++                    # 将第 3 项之后的内容合并到 object
++                    elif len(triple) > 3:
++                        repaired = [
++                            triple[0],
++                            triple[1],
++                            " ".join(value for value in triple[2:] if value)
++                        ]
++
++                        logger.warning(
++                            f"Repairing {len(triple)}-element triple "
++                            f"for chunk_id {chunk_id}: "
++                            f"{triple} -> {repaired}"
++                        )
++
++                        repaired_triples.append(repaired)
++
++                    # 2 元组：使用 LLM 修复
++                    elif len(triple) == 2:
++                        repair_prompt = f"""
++You are repairing an RDF triple extraction result.
++
++The input contains exactly two strings:
++
++{json.dumps(triple, ensure_ascii=False)}
++
++Convert it into exactly one valid RDF triple.
++
++Rules:
++1. Output JSON only.
++2. The output MUST be an object with the key "triples".
++3. "triples" MUST contain exactly one triple.
++4. The triple MUST contain exactly three strings:
++   [subject, predicate, object]
++5. Keep the subject unchanged.
++6. Split the second input string into a predicate and an object.
++7. Preserve the original meaning.
++8. Do not add information that is not present in the input.
++9. Never output fewer or more than three elements.
++
++Example:
++
++Input:
++["Raymond", "is a summer recreation area"]
++
++Output:
++{{"triples":[["Raymond","is","a summer recreation area"]]}}
++
++Now repair this input:
++
++{json.dumps(triple, ensure_ascii=False)}
++"""
++
++                        try:
++                            repair_messages = [[
++                                {
++                                    "role": "user",
++                                    "content": repair_prompt
++                                }
++                            ]]
++
++                            repair_response, _ = self.llm_model.batch_infer(
++                                repair_messages,
++                                json_template="triples",
++                                max_tokens=128
++                            )
++
++                            repaired_json = json.loads(repair_response[0])
++                            repaired_result = repaired_json["triples"]
++
++                            if (
++                                isinstance(repaired_result, list)
++                                and len(repaired_result) == 1
++                                and isinstance(repaired_result[0], list)
++                                and len(repaired_result[0]) == 3
++                                and all(
++                                    isinstance(x, str)
++                                    for x in repaired_result[0]
++                                )
++                            ):
++                                repaired_triple = repaired_result[0]
++                                repaired_triples.append(repaired_triple)
++
++                                logger.warning(
++                                    f"LLM repaired 2-element triple "
++                                    f"for chunk_id {chunk_id}: "
++                                    f"{triple} -> {repaired_triple}"
++                                )
++                            else:
++                                logger.warning(
++                                    f"LLM repair returned invalid format "
++                                    f"for chunk_id {chunk_id}: "
++                                    f"{repair_response[0]}"
++                                )
++
++                        except Exception as repair_error:
++                            logger.warning(
++                                f"LLM repair failed for chunk_id {chunk_id}: "
++                                f"{repair_error}"
++                            )
++
++                    # 0/1 元组：无法可靠修复，直接丢弃
++                    else:
++                        logger.warning(
++                            f"Dropping invalid {len(triple)}-element triple "
++                            f"for chunk_id {chunk_id}: {triple}"
++                        )
++
++                triples = repaired_triples
++
+             except Exception as e:
+                 triples = []
+                 logger.warning(f"Could not parse response from OpenIE: {e}")
++
+             if len(triples) == 0:
+                 logger.warning("No triples extracted for chunk_id: {}".format(chunk_id))
+             triple_raw_output = TripleRawOutput(chunk_id, response, triples, {})
+diff --git a/src/hipporag/llm/transformers_llm.py b/src/hipporag/llm/transformers_llm.py
+index 8786dad..337a80e 100644
+--- a/src/hipporag/llm/transformers_llm.py
++++ b/src/hipporag/llm/transformers_llm.py
+@@ -6,7 +6,11 @@ import time
+ import hashlib
+ import torch
+ 
+-from transformers import AutoModelForCausalLM, AutoTokenizer
++from transformers import (
++    AutoModelForCausalLM,
++    AutoTokenizer,
++    BitsAndBytesConfig,
++)
+ from filelock import FileLock
+ 
+ from .base import BaseLLM, LLMConfig, normalize_generation_token_params
+@@ -92,9 +96,54 @@ class TransformersLLM(BaseLLM):
+             os.path.join(global_config.save_dir, "llm_cache"),
+             self.llm_name.replace('/', '_'))
+         self.model_id = self.global_config.llm_name.removeprefix("Transformers/")
+-        self.model = AutoModelForCausalLM.from_pretrained(self.model_id, device_map="auto", torch_dtype=torch.bfloat16)
++        quantization_config = BitsAndBytesConfig(
++            load_in_4bit=True,
++            bnb_4bit_quant_type="nf4",
++            bnb_4bit_compute_dtype=torch.float16,
++            bnb_4bit_use_double_quant=True,
++        )
++
++        self.model = AutoModelForCausalLM.from_pretrained(
++            self.model_id,
++            quantization_config=quantization_config,
++            device_map="auto",
++            torch_dtype=torch.float16,
++        )
+         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+ 
++
++    def unload_model(self):
++        import gc
++        import torch
++
++        if getattr(self, "model", None) is not None:
++            del self.model
++            self.model = None
++
++        gc.collect()
++
++        if torch.cuda.is_available():
++            torch.cuda.empty_cache()
++            torch.cuda.ipc_collect()
++
++    def reload_model(self):
++        import torch
++        from transformers import AutoModelForCausalLM, BitsAndBytesConfig
++
++        quantization_config = BitsAndBytesConfig(
++            load_in_4bit=True,
++            bnb_4bit_quant_type="nf4",
++            bnb_4bit_compute_dtype=torch.float16,
++            bnb_4bit_use_double_quant=True,
++        )
++
++        self.model = AutoModelForCausalLM.from_pretrained(
++            self.model_id,
++            quantization_config=quantization_config,
++            device_map="auto",
++            torch_dtype=torch.float16,
++        )
++
+         self.retry = 5
+         
+         logger.info(f"[TransformersLLM] Model-ID: {self.global_config.llm_name}, Cache: {self.cache.cache_filepath}")
+diff --git a/src/hipporag/llm/vllm_offline.py b/src/hipporag/llm/vllm_offline.py
+index 67451f1..81fa9a4 100644
+--- a/src/hipporag/llm/vllm_offline.py
++++ b/src/hipporag/llm/vllm_offline.py
+@@ -50,7 +50,7 @@ class VLLMOffline:
+         self.model_name = model_name
+         self.client = LLM(model=model_name, tensor_parallel_size=tensor_parallel_size, pipeline_parallel_size=pipeline_parallel_size,
+                           seed=kwargs.get('seed', 0), dtype='auto', max_seq_len_to_capture=max_model_len, enable_prefix_caching=True,
+-                          enforce_eager=False, gpu_memory_utilization=kwargs.get('gpu_memory_utilization', 0.6),
++                          enforce_eager=False, gpu_memory_utilization=kwargs.get('gpu_memory_utilization', 0.85),
+                           max_model_len=max_model_len, quantization=kwargs.get('quantization', None), load_format=kwargs.get('load_format', 'auto'), trust_remote_code=True)
+         
+         self.tokenizer = self.client.get_tokenizer()
+@@ -84,14 +84,53 @@ class VLLMOffline:
+             from vllm.model_executor.guided_decoding.guided_fields import GuidedDecodingRequest
+             guided = GuidedDecodingRequest(guided_json=PROMPT_JSON_TEMPLATE[json_template])
+ 
+-        all_prompt_ids = [convert_text_chat_messages_to_input_ids(messages, self.tokenizer) for messages in messages_list]
+-        vllm_output = self.client.generate(prompt_token_ids=all_prompt_ids,
+-                                           sampling_params=SamplingParams(max_tokens=max_tokens, temperature=0),
+-                                           guided_options_request=guided)
++        # Process requests in small batches to avoid malformed outputs
++        # when thousands of prompts are submitted to vLLM at once.
++        batch_size = 64
+ 
+-        all_responses = [completion.outputs[0].text for completion in vllm_output]
+-        all_prompt_tokens = [len(completion.prompt_token_ids) for completion in vllm_output]
+-        all_completion_tokens = [len(completion.outputs[0].token_ids) for completion in vllm_output]
++        all_responses = []
++        all_prompt_tokens = []
++        all_completion_tokens = []
++
++        for batch_start in range(0, len(messages_list), batch_size):
++            batch_messages = messages_list[batch_start:batch_start + batch_size]
++
++            logger.info(
++                f"VLLM batch progress: "
++                f"{batch_start + 1}-"
++                f"{min(batch_start + batch_size, len(messages_list))}/"
++                f"{len(messages_list)}"
++            )
++
++            batch_prompt_ids = [
++                convert_text_chat_messages_to_input_ids(messages, self.tokenizer)
++                for messages in batch_messages
++            ]
++
++            batch_output = self.client.generate(
++                prompt_token_ids=batch_prompt_ids,
++                sampling_params=SamplingParams(max_tokens=max_tokens, temperature=0),
++                guided_options_request=guided
++            )
++
++            all_responses.extend(
++                [completion.outputs[0].text for completion in batch_output]
++            )
++            all_prompt_tokens.extend(
++                [len(completion.prompt_token_ids) for completion in batch_output]
++            )
++            all_completion_tokens.extend(
++                [len(completion.outputs[0].token_ids) for completion in batch_output]
++            )
++
++        if json_template is not None:
++            logger.info(
++                f"OpenIE debug: template={json_template}, "
++                f"max_tokens={max_tokens}, "
++                f"completion_tokens_min={min(all_completion_tokens)}, "
++                f"completion_tokens_max={max(all_completion_tokens)}, "
++                f"completion_tokens_avg={sum(all_completion_tokens)/len(all_completion_tokens):.1f}"
++            )
+ 
+         metadata = {
+             "prompt_tokens": sum(all_prompt_tokens),
+diff --git a/src/hipporag/prompts/templates/triple_extraction.py b/src/hipporag/prompts/templates/triple_extraction.py
+index 06d6754..a5896a3 100644
+--- a/src/hipporag/prompts/templates/triple_extraction.py
++++ b/src/hipporag/prompts/templates/triple_extraction.py
+@@ -7,6 +7,27 @@ Respond with a JSON list of triples, with each triple representing a relationshi
+ Pay attention to the following requirements:
+ - Each triple should contain at least one, but preferably two, of the named entities in the list for each passage.
+ - Clearly resolve pronouns to their specific names to maintain clarity.
++- Every triple MUST contain exactly 3 strings in the format [subject, predicate, object].
++- Never output a triple with fewer or more than 3 elements.
++- Each triple must be a list of exactly three strings.
++- The three elements must be exactly: [subject, predicate, object].
++- If a relation contains extra words such as "in the final", keep them inside the predicate or object so that the triple still has exactly 3 elements.
++- NEVER split one semantic relation into 4 or 5 elements.
++
++Correct:
++["South Africa", "defeated", "West Indies"]
++
++Correct:
++["The Awakening", "has", "meaningful depth"]
++
++Incorrect:
++["South Africa", "defeated", "West Indies", "in the final"]
++
++Incorrect:
++["The Awakening", "has meaningful depth"]
++
++Incorrect:
++["Ray Ricardo Wynter", "played cricket from", "1975", "until", "1982"]
+ 
+ """
+ 

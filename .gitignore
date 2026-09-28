@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Model files
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Experiment outputs
+outputs/
+logs/
+*.log
+
+# Cache
+.cache/
+.huggingface/
+.nv/
+.triton/
+
+# Temporary files
+*.bak
+*.before*
+
+# Debug backup files
+*.bak*
+*.before*
+*.batch_bak
+*.debug_bak
+
+# Dataset
+data/
+datasets/
+
+# Results
+results/
+outputs/
+
+# Vector database
+*.faiss
+*.index
+
+# Knowledge graph
+*.pkl
+*.pickle
+
+# Environment
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Dataset
+reproduce/dataset/
